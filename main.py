@@ -51,13 +51,12 @@ MAX_OUTPUT_TOKENS = int(
 # Local Model Directory
 # ============================================================
 #
-# No global/shared HuggingFace cache is configured.
+# The model is downloaded into this deployment-specific folder.
 #
-# Everything is stored inside this deployment:
+# No global HuggingFace cache is configured.
 #
-#   /workspace/project/models/gemma-4-12b
-#
-# If the Kubernetes Job is deleted, the model is deleted too.
+# If the Kubernetes Job is deleted, the downloaded model is
+# deleted with the container.
 #
 # ============================================================
 
@@ -84,6 +83,8 @@ os.makedirs(
 model = None
 processor = None
 
+_dtype_hooks = []
+
 
 # ============================================================
 # Response Model
@@ -98,6 +99,216 @@ class GenerateResponse(BaseModel):
     input_tokens: int
 
     output_tokens: int
+
+
+# ============================================================
+# Multimodal Dtype Helpers
+# ============================================================
+
+MULTIMODAL_KEYWORDS = (
+    "vision",
+    "visual",
+    "image",
+    "audio",
+    "multimodal",
+    "multi_modal",
+    "mm_",
+    "mm.",
+    "embedder",
+    "projector",
+    "projection",
+)
+
+
+def is_multimodal_module(name: str) -> bool:
+
+    name = name.lower()
+
+    return any(
+        keyword in name
+        for keyword in MULTIMODAL_KEYWORDS
+    )
+
+
+def get_module_parameter_dtype(module):
+
+    """
+    Return the first floating-point parameter dtype of a module.
+
+    Quantized BitsAndBytes modules are intentionally ignored.
+
+    We only use this for the multimodal dtype-alignment hooks.
+    """
+
+    for parameter in module.parameters(
+        recurse=False
+    ):
+
+        if parameter.is_floating_point():
+
+            return parameter.dtype
+
+    return None
+
+
+def align_multimodal_inputs(module, inputs):
+
+    """
+    Align floating-point inputs with the dtype expected by the
+    receiving multimodal module.
+
+    This does NOT blindly convert all tensors.
+
+    Integer tensors such as input_ids and position IDs remain
+    untouched.
+
+    Only floating-point tensors are considered.
+    """
+
+    target_dtype = get_module_parameter_dtype(
+        module
+    )
+
+    if target_dtype is None:
+
+        return inputs
+
+    def convert(value):
+
+        if isinstance(value, torch.Tensor):
+
+            if value.is_floating_point():
+
+                if value.dtype != target_dtype:
+
+                    return value.to(
+                        dtype=target_dtype
+                    )
+
+            return value
+
+        if isinstance(value, tuple):
+
+            return tuple(
+                convert(item)
+                for item in value
+            )
+
+        if isinstance(value, list):
+
+            return [
+                convert(item)
+                for item in value
+            ]
+
+        return value
+
+    return tuple(
+        convert(value)
+        for value in inputs
+    )
+
+
+def multimodal_dtype_hook(
+    module,
+    inputs
+):
+
+    return align_multimodal_inputs(
+        module,
+        inputs
+    )
+
+
+def install_multimodal_dtype_hooks(model):
+
+    """
+    Install lightweight forward-pre-hooks only on multimodal
+    modules that have floating-point parameters.
+
+    This is deliberately narrow.
+
+    We do NOT:
+        - convert the whole model to FP32
+        - convert the whole model to BF16
+        - modify 4-bit BitsAndBytes layers
+        - modify token IDs or attention masks
+    """
+
+    global _dtype_hooks
+
+    installed = 0
+
+    print()
+    print("==========================================")
+    print(" Multimodal Dtype Compatibility Setup")
+    print("==========================================")
+
+    for name, module in model.named_modules():
+
+        if not is_multimodal_module(name):
+
+            continue
+
+        # Don't interfere with BitsAndBytes quantized modules.
+        class_name = module.__class__.__name__.lower()
+
+        if "linear4bit" in class_name:
+            continue
+
+        if "linear8bit" in class_name:
+            continue
+
+        dtype = get_module_parameter_dtype(
+            module
+        )
+
+        if dtype is None:
+
+            continue
+
+        handle = module.register_forward_pre_hook(
+            multimodal_dtype_hook
+        )
+
+        _dtype_hooks.append(
+            handle
+        )
+
+        installed += 1
+
+        print(
+            f"[dtype-hook] {name}"
+            f" -> {dtype}"
+        )
+
+    print()
+    print(
+        f"Installed {installed} multimodal dtype hooks."
+    )
+
+    if installed == 0:
+
+        print(
+            "No matching multimodal modules found."
+        )
+
+
+def remove_multimodal_dtype_hooks():
+
+    global _dtype_hooks
+
+    for handle in _dtype_hooks:
+
+        try:
+
+            handle.remove()
+
+        except Exception:
+
+            pass
+
+    _dtype_hooks = []
 
 
 # ============================================================
@@ -168,6 +379,28 @@ class ModelLoader:
         )
 
         # ----------------------------------------------------
+        # CUDA information
+        # ----------------------------------------------------
+
+        print()
+        print("CUDA information:")
+
+        print(
+            "  PyTorch:",
+            torch.__version__
+        )
+
+        print(
+            "  CUDA:",
+            torch.version.cuda
+        )
+
+        print(
+            "  Device:",
+            torch.cuda.get_device_name(0)
+        )
+
+        # ----------------------------------------------------
         # Clear CUDA cache
         # ----------------------------------------------------
 
@@ -228,18 +461,15 @@ class ModelLoader:
             "if it is not already present."
         )
 
+        #
         # IMPORTANT:
         #
-        # Do NOT force dtype=torch.bfloat16 here.
+        # Do not force dtype=torch.bfloat16 here.
         #
-        # The multimodal Gemma architecture contains components
-        # that expect different dtypes. BitsAndBytes handles the
-        # quantized weights and compute dtype itself.
+        # The model contains multimodal components with their
+        # own dtype requirements.
         #
-        # Forcing the entire model to BF16 can result in:
-        #
-        # RuntimeError:
-        # expected scalar type Float but found BFloat16
+        # BitsAndBytes handles the 4-bit language-model weights.
         #
         # ----------------------------------------------------
 
@@ -258,6 +488,18 @@ class ModelLoader:
 
         self.model.eval()
 
+        # ----------------------------------------------------
+        # Install targeted multimodal dtype compatibility hooks
+        # ----------------------------------------------------
+
+        install_multimodal_dtype_hooks(
+            self.model
+        )
+
+        # ----------------------------------------------------
+        # Model information
+        # ----------------------------------------------------
+
         print()
         print("==========================================")
         print("       Gemma 4 12B Model Ready")
@@ -271,6 +513,33 @@ class ModelLoader:
                 "unknown"
             )
         )
+
+        # ----------------------------------------------------
+        # GPU memory after model load
+        # ----------------------------------------------------
+
+        if torch.cuda.is_available():
+
+            allocated = (
+                torch.cuda.memory_allocated(0)
+                / (1024 ** 3)
+            )
+
+            reserved = (
+                torch.cuda.memory_reserved(0)
+                / (1024 ** 3)
+            )
+
+            print()
+            print(
+                f"GPU memory allocated: "
+                f"{allocated:.2f} GB"
+            )
+
+            print(
+                f"GPU memory reserved: "
+                f"{reserved:.2f} GB"
+            )
 
         return (
             self.model,
@@ -300,7 +569,7 @@ app = FastAPI(
         "supporting text, optional images, and optional audio."
     ),
 
-    version="1.2.0"
+    version="1.3.0"
 )
 
 
@@ -320,29 +589,58 @@ def health():
             detail="Model is not loaded."
         )
 
-    return {
+    gpu_memory = None
 
-        "status": "ok",
+    if torch.cuda.is_available():
 
-        "model": MODEL_NAME,
+        gpu_memory = {
 
-        "cuda": torch.cuda.is_available(),
+            "allocated_gb": round(
+                torch.cuda.memory_allocated(0)
+                / (1024 ** 3),
+                2
+            ),
 
-        "gpu": (
-            torch.cuda.get_device_name(0)
-            if torch.cuda.is_available()
-            else None
-        ),
+            "reserved_gb": round(
+                torch.cuda.memory_reserved(0)
+                / (1024 ** 3),
+                2
+            ),
 
-        "gpu_memory_gb": (
-            round(
-                torch.cuda.get_device_properties(0).total_memory
+            "total_gb": round(
+                torch.cuda.get_device_properties(0)
+                .total_memory
                 / (1024 ** 3),
                 2
             )
-            if torch.cuda.is_available()
-            else None
-        ),
+        }
+
+    return {
+
+        "status":
+            "ok",
+
+        "model":
+            MODEL_NAME,
+
+        "cuda":
+            torch.cuda.is_available(),
+
+        "torch_version":
+            torch.__version__,
+
+        "cuda_version":
+            torch.version.cuda,
+
+        "gpu":
+            (
+                torch.cuda.get_device_name(0)
+                if torch.cuda.is_available()
+                else None
+            ),
+
+        "gpu_memory":
+            gpu_memory,
 
         "max_input_tokens":
             MAX_INPUT_TOKENS,
@@ -406,34 +704,39 @@ def root():
 
 
 # ============================================================
-# Helper: Move Inputs to CUDA
+# Move Input Tensors to CUDA
 # ============================================================
 
 def move_inputs_to_cuda(inputs):
 
     """
-    Move tensor inputs to CUDA while preserving their
-    original dtype.
+    Move tensors to CUDA while preserving their dtype.
 
-    This is important for Gemma 4 multimodal inputs because
-    different tensors can legitimately use different dtypes.
+    IMPORTANT:
 
-    We intentionally DO NOT do:
+    We do NOT call:
 
         inputs.to(torch.bfloat16)
 
-    because input_ids / masks must remain integer/bool and
-    some multimodal features are expected to remain float32.
+    because:
+        input_ids must remain integer
+        attention masks must remain integer/bool
+        image/audio tensors may require different dtypes
     """
 
     moved = {}
 
     for key, value in inputs.items():
 
-        if isinstance(value, torch.Tensor):
+        if isinstance(
+            value,
+            torch.Tensor
+        ):
 
             moved[key] = value.to(
+
                 "cuda",
+
                 non_blocking=True
             )
 
@@ -649,7 +952,6 @@ async def generate(
                     "Uploaded audio is empty."
                 )
 
-            # Gemma audio processing uses 16 kHz.
             audio_data, sample_rate = librosa.load(
 
                 io.BytesIO(
@@ -751,7 +1053,7 @@ async def generate(
         )
 
         # ====================================================
-        # Debug input tensors
+        # Print input tensor information
         # ====================================================
 
         print(
@@ -811,13 +1113,7 @@ async def generate(
             )
 
         # ====================================================
-        # Move tensors to GPU
-        # ====================================================
-        #
-        # Preserve dtype of every tensor.
-        #
-        # Do NOT convert everything to BF16.
-        #
+        # Move inputs to CUDA
         # ====================================================
 
         print(
@@ -827,6 +1123,29 @@ async def generate(
         inputs = move_inputs_to_cuda(
             inputs
         )
+
+        # ====================================================
+        # Print CUDA input information
+        # ====================================================
+
+        print(
+            "CUDA input tensors:"
+        )
+
+        for key, value in inputs.items():
+
+            if isinstance(
+                value,
+                torch.Tensor
+            ):
+
+                print(
+
+                    f"  {key}: "
+                    f"shape={tuple(value.shape)}, "
+                    f"dtype={value.dtype}, "
+                    f"device={value.device}"
+                )
 
         # ====================================================
         # Generation arguments
@@ -915,6 +1234,8 @@ async def generate(
 
         return GenerateResponse(
 
+            model=MODEL_NAME,
+
             response=response,
 
             input_tokens=input_tokens,
@@ -970,7 +1291,6 @@ async def generate(
             repr(exc)
         )
 
-        # Clear cache after failed inference.
         torch.cuda.empty_cache()
 
         raise HTTPException(
