@@ -1,0 +1,85 @@
+apiVersion: batch/v1
+kind: Job
+
+metadata:
+  name: gemma-server
+
+spec:
+
+  backoffLimit: 0
+
+  template:
+
+    spec:
+
+      restartPolicy: Never
+
+      containers:
+
+        - name: gemma-container
+
+          image: nvcr.io/nvidia/pytorch:25.04-py3
+
+          env:
+
+            # Gemma model
+            - name: MODEL_NAME
+              value: google/gemma-4-12B-it
+
+            # Maximum input/context tokens
+            - name: MAX_INPUT_TOKENS
+              value: "8192"
+
+            # Maximum generated/output tokens
+            - name: MAX_OUTPUT_TOKENS
+              value: "512"
+
+          command:
+            - /bin/bash
+            - -c
+
+          args:
+            - |
+
+              set -euo pipefail
+
+              echo "=========================================="
+              echo "       Starting Gemma Kubernetes Job"
+              echo "=========================================="
+
+              cd /workspace
+
+              echo
+              echo "[1] Cloning GitHub repository..."
+
+              rm -rf project || true
+
+              git clone \
+                https://github.com/Victowolf/gemma.git \
+                project
+
+              cd project
+
+              echo
+              echo "[2] Repository contents"
+
+              ls -la
+
+              echo
+              echo "[3] Starting start.sh"
+
+              chmod +x start.sh
+
+              ./start.sh
+
+          ports:
+
+            - name: http
+
+              containerPort: 8000
+
+          resources:
+
+            limits:
+
+              nvidia.com/mig-1g.18gb: 1
