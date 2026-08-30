@@ -51,12 +51,13 @@ MAX_OUTPUT_TOKENS = int(
 # Local Model Directory
 # ============================================================
 #
-# The model is downloaded into this deployment's own directory.
+# No global/shared HuggingFace cache is configured.
 #
-# No shared HuggingFace cache is configured.
+# Everything is stored inside this deployment:
 #
-# When the Kubernetes Job/container is deleted, this directory
-# disappears with it.
+#   /workspace/project/models/gemma-4-12b
+#
+# If the Kubernetes Job is deleted, the model is deleted too.
 #
 # ============================================================
 
@@ -194,7 +195,7 @@ class ModelLoader:
         )
 
         # ----------------------------------------------------
-        # 4-bit Quantization
+        # 4-bit NF4 Quantization
         # ----------------------------------------------------
 
         print()
@@ -214,7 +215,7 @@ class ModelLoader:
         )
 
         # ----------------------------------------------------
-        # Model
+        # Load Model
         # ----------------------------------------------------
 
         print()
@@ -227,6 +228,21 @@ class ModelLoader:
             "if it is not already present."
         )
 
+        # IMPORTANT:
+        #
+        # Do NOT force dtype=torch.bfloat16 here.
+        #
+        # The multimodal Gemma architecture contains components
+        # that expect different dtypes. BitsAndBytes handles the
+        # quantized weights and compute dtype itself.
+        #
+        # Forcing the entire model to BF16 can result in:
+        #
+        # RuntimeError:
+        # expected scalar type Float but found BFloat16
+        #
+        # ----------------------------------------------------
+
         self.model = AutoModelForMultimodalLM.from_pretrained(
 
             MODEL_NAME,
@@ -236,8 +252,6 @@ class ModelLoader:
             device_map="auto",
 
             cache_dir=MODEL_PATH,
-
-            dtype=torch.bfloat16,
 
             low_cpu_mem_usage=True
         )
@@ -286,7 +300,7 @@ app = FastAPI(
         "supporting text, optional images, and optional audio."
     ),
 
-    version="1.1.0"
+    version="1.2.0"
 )
 
 
@@ -320,11 +334,30 @@ def health():
             else None
         ),
 
+        "gpu_memory_gb": (
+            round(
+                torch.cuda.get_device_properties(0).total_memory
+                / (1024 ** 3),
+                2
+            )
+            if torch.cuda.is_available()
+            else None
+        ),
+
         "max_input_tokens":
             MAX_INPUT_TOKENS,
 
         "max_output_tokens":
-            MAX_OUTPUT_TOKENS
+            MAX_OUTPUT_TOKENS,
+
+        "modalities": [
+
+            "text",
+
+            "image",
+
+            "audio"
+        ]
     }
 
 
@@ -370,6 +403,45 @@ def root():
                 "/docs"
         }
     }
+
+
+# ============================================================
+# Helper: Move Inputs to CUDA
+# ============================================================
+
+def move_inputs_to_cuda(inputs):
+
+    """
+    Move tensor inputs to CUDA while preserving their
+    original dtype.
+
+    This is important for Gemma 4 multimodal inputs because
+    different tensors can legitimately use different dtypes.
+
+    We intentionally DO NOT do:
+
+        inputs.to(torch.bfloat16)
+
+    because input_ids / masks must remain integer/bool and
+    some multimodal features are expected to remain float32.
+    """
+
+    moved = {}
+
+    for key, value in inputs.items():
+
+        if isinstance(value, torch.Tensor):
+
+            moved[key] = value.to(
+                "cuda",
+                non_blocking=True
+            )
+
+        else:
+
+            moved[key] = value
+
+    return moved
 
 
 # ============================================================
@@ -486,7 +558,10 @@ async def generate(
 
             status_code=400,
 
-            detail="max_output_tokens must be at least 1."
+            detail=(
+                "max_output_tokens must be "
+                "at least 1."
+            )
         )
 
     output_limit = min(
@@ -527,13 +602,16 @@ async def generate(
                 io.BytesIO(
                     image_bytes
                 )
+
             ).convert("RGB")
 
             content.append({
 
-                "type": "image",
+                "type":
+                    "image",
 
-                "image": pil_image
+                "image":
+                    pil_image
             })
 
             print(
@@ -546,7 +624,9 @@ async def generate(
 
                 status_code=400,
 
-                detail=f"Invalid image: {exc}"
+                detail=(
+                    f"Invalid image: {exc}"
+                )
             )
 
     # ========================================================
@@ -569,6 +649,7 @@ async def generate(
                     "Uploaded audio is empty."
                 )
 
+            # Gemma audio processing uses 16 kHz.
             audio_data, sample_rate = librosa.load(
 
                 io.BytesIO(
@@ -582,9 +663,11 @@ async def generate(
 
             content.append({
 
-                "type": "audio",
+                "type":
+                    "audio",
 
-                "audio": audio_data
+                "audio":
+                    audio_data
             })
 
             print(
@@ -599,7 +682,9 @@ async def generate(
 
                 status_code=400,
 
-                detail=f"Invalid audio: {exc}"
+                detail=(
+                    f"Invalid audio: {exc}"
+                )
             )
 
     # ========================================================
@@ -608,9 +693,11 @@ async def generate(
 
     content.append({
 
-        "type": "text",
+        "type":
+            "text",
 
-        "text": prompt
+        "text":
+            prompt
     })
 
     # ========================================================
@@ -623,16 +710,20 @@ async def generate(
 
         messages.append({
 
-            "role": "system",
+            "role":
+                "system",
 
-            "content": system_prompt
+            "content":
+                system_prompt
         })
 
     messages.append({
 
-        "role": "user",
+        "role":
+            "user",
 
-        "content": content
+        "content":
+            content
     })
 
     try:
@@ -642,7 +733,9 @@ async def generate(
         # ====================================================
 
         print()
-        print("Processing multimodal input...")
+        print(
+            "Processing multimodal input..."
+        )
 
         inputs = processor.apply_chat_template(
 
@@ -656,6 +749,29 @@ async def generate(
 
             add_generation_prompt=True
         )
+
+        # ====================================================
+        # Debug input tensors
+        # ====================================================
+
+        print(
+            "Input tensors:"
+        )
+
+        for key, value in inputs.items():
+
+            if isinstance(
+                value,
+                torch.Tensor
+            ):
+
+                print(
+
+                    f"  {key}: "
+                    f"shape={tuple(value.shape)}, "
+                    f"dtype={value.dtype}, "
+                    f"device={value.device}"
+                )
 
         # ====================================================
         # Input token count
@@ -695,17 +811,25 @@ async def generate(
             )
 
         # ====================================================
-        # Move tensors to model device
+        # Move tensors to GPU
+        # ====================================================
+        #
+        # Preserve dtype of every tensor.
+        #
+        # Do NOT convert everything to BF16.
+        #
         # ====================================================
 
-        device = next(
-            model.parameters()
-        ).device
+        print(
+            "Moving input tensors to CUDA..."
+        )
 
-        inputs = inputs.to(device)
+        inputs = move_inputs_to_cuda(
+            inputs
+        )
 
         # ====================================================
-        # Generation parameters
+        # Generation arguments
         # ====================================================
 
         generation_args = {
@@ -714,37 +838,22 @@ async def generate(
                 output_limit,
 
             "do_sample":
-                do_sample,
-
-            "top_p":
-                top_p,
-
-            "top_k":
-                top_k
+                do_sample
         }
 
         if do_sample:
 
-            generation_args[
+            generation_args.update({
 
-                "temperature"
+                "temperature":
+                    temperature,
 
-            ] = temperature
+                "top_p":
+                    top_p,
 
-        else:
-
-            # Deterministic generation
-            # avoids sampling parameters
-
-            generation_args.pop(
-                "top_p",
-                None
-            )
-
-            generation_args.pop(
-                "top_k",
-                None
-            )
+                "top_k":
+                    top_k
+            })
 
         # ====================================================
         # Generate
@@ -766,7 +875,7 @@ async def generate(
             )
 
         # ====================================================
-        # Remove prompt tokens
+        # Remove input tokens
         # ====================================================
 
         generated_ids = outputs[
@@ -806,8 +915,6 @@ async def generate(
 
         return GenerateResponse(
 
-            model=MODEL_NAME,
-
             response=response,
 
             input_tokens=input_tokens,
@@ -824,10 +931,14 @@ async def generate(
         raise
 
     # ========================================================
-    # GPU OOM
+    # CUDA OOM
     # ========================================================
 
     except torch.cuda.OutOfMemoryError:
+
+        print(
+            "CUDA OUT OF MEMORY"
+        )
 
         torch.cuda.empty_cache()
 
@@ -835,15 +946,42 @@ async def generate(
 
             status_code=507,
 
-            detail=(
-                "GPU out of memory. "
-                "Reduce input size, image/audio size, "
-                "or max_output_tokens."
-            )
+            detail={
+
+                "error":
+                    "gpu_out_of_memory",
+
+                "message": (
+                    "GPU out of memory. "
+                    "Reduce input size or "
+                    "max_output_tokens."
+                )
+            }
         )
 
     # ========================================================
-    # General Error
+    # Runtime Errors
+    # ========================================================
+
+    except RuntimeError as exc:
+
+        print(
+            "Runtime error:",
+            repr(exc)
+        )
+
+        # Clear cache after failed inference.
+        torch.cuda.empty_cache()
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=str(exc)
+        )
+
+    # ========================================================
+    # General Errors
     # ========================================================
 
     except Exception as exc:
