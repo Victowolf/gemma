@@ -33,6 +33,9 @@ spec:
             # Maximum generated/output tokens
             - name: MAX_OUTPUT_TOKENS
               value: "512"
+            
+            - name: BNB_CUDA_VERSION
+              value: "128"
 
           command:
             - /bin/bash
