@@ -39,7 +39,6 @@ echo
 echo "[7] Installing Gemma dependencies"
 
 unset PIP_CONSTRAINT
-echo $PIP_CONSTRAINT
 python -m pip config list -v
 env | grep -i pip
 
