@@ -648,6 +648,8 @@ def health():
         "max_output_tokens":
             MAX_OUTPUT_TOKENS,
 
+        "max_images": MAX_IMAGES,
+
         "modalities": [
 
             "text",
@@ -746,10 +748,14 @@ def move_inputs_to_cuda(inputs):
 
     return moved
 
-
 # ============================================================
 # Generate
 # ============================================================
+
+MAX_IMAGES = int(
+    os.getenv("MAX_IMAGES", "4")
+)
+
 
 @app.post(
     "/generate",
@@ -763,10 +769,16 @@ async def generate(
         default=None
     ),
 
-    image: UploadFile | None = File(
+    # --------------------------------------------------------
+    # 0–4 images
+    # --------------------------------------------------------
+    images: list[UploadFile] | None = File(
         default=None
     ),
 
+    # --------------------------------------------------------
+    # Optional audio
+    # --------------------------------------------------------
     audio: UploadFile | None = File(
         default=None
     ),
@@ -774,6 +786,10 @@ async def generate(
     max_output_tokens: int | None = Form(
         default=None
     ),
+
+    MAX_IMAGES = int(
+      os.getenv("MAX_IMAGES", "4")
+    )
 
     temperature: float = Form(
         default=0.7
@@ -799,11 +815,40 @@ async def generate(
     if model is None:
 
         raise HTTPException(
-
             status_code=503,
-
             detail="Model is not loaded."
         )
+
+    # ========================================================
+    # Normalize images
+    # ========================================================
+
+    if images is None:
+        images = []
+
+    # ========================================================
+    # Validate image count
+    # ========================================================
+
+    if len(images) > MAX_IMAGES:
+
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "too_many_images",
+                "message": (
+                    f"A maximum of {MAX_IMAGES} "
+                    "images can be supplied."
+                ),
+                "received": len(images),
+                "maximum": MAX_IMAGES
+            }
+        )
+
+    print()
+    print(
+        f"Images received: {len(images)} / {MAX_IMAGES}"
+    )
 
     # ========================================================
     # Validate generation parameters
@@ -812,9 +857,7 @@ async def generate(
     if temperature < 0.0 or temperature > 2.0:
 
         raise HTTPException(
-
             status_code=400,
-
             detail=(
                 "temperature must be between "
                 "0.0 and 2.0."
@@ -824,9 +867,7 @@ async def generate(
     if top_p <= 0.0 or top_p > 1.0:
 
         raise HTTPException(
-
             status_code=400,
-
             detail=(
                 "top_p must be greater than 0 "
                 "and at most 1.0."
@@ -836,9 +877,7 @@ async def generate(
     if top_k < 0:
 
         raise HTTPException(
-
             status_code=400,
-
             detail="top_k cannot be negative."
         )
 
@@ -858,9 +897,7 @@ async def generate(
     if requested_output < 1:
 
         raise HTTPException(
-
             status_code=400,
-
             detail=(
                 "max_output_tokens must be "
                 "at least 1."
@@ -868,9 +905,7 @@ async def generate(
         )
 
     output_limit = min(
-
         requested_output,
-
         MAX_OUTPUT_TOKENS
     )
 
@@ -881,15 +916,17 @@ async def generate(
     content = []
 
     # ========================================================
-    # IMAGE
+    # IMAGES
     # ========================================================
 
-    if image is not None:
+    for index, image in enumerate(images):
 
         try:
 
             print(
-                f"Receiving image: {image.filename}"
+                f"Receiving image "
+                f"{index + 1}/{len(images)}: "
+                f"{image.filename}"
             )
 
             image_bytes = await image.read()
@@ -901,24 +938,18 @@ async def generate(
                 )
 
             pil_image = Image.open(
-
-                io.BytesIO(
-                    image_bytes
-                )
-
+                io.BytesIO(image_bytes)
             ).convert("RGB")
 
             content.append({
 
-                "type":
-                    "image",
+                "type": "image",
 
-                "image":
-                    pil_image
+                "image": pil_image
             })
 
             print(
-                "Image loaded successfully."
+                f"Image {index + 1} loaded successfully."
             )
 
         except Exception as exc:
@@ -927,9 +958,12 @@ async def generate(
 
                 status_code=400,
 
-                detail=(
-                    f"Invalid image: {exc}"
-                )
+                detail={
+                    "error": "invalid_image",
+                    "image_index": index,
+                    "filename": image.filename,
+                    "message": str(exc)
+                }
             )
 
     # ========================================================
@@ -941,7 +975,8 @@ async def generate(
         try:
 
             print(
-                f"Receiving audio: {audio.filename}"
+                f"Receiving audio: "
+                f"{audio.filename}"
             )
 
             audio_bytes = await audio.read()
@@ -954,9 +989,7 @@ async def generate(
 
             audio_data, sample_rate = librosa.load(
 
-                io.BytesIO(
-                    audio_bytes
-                ),
+                io.BytesIO(audio_bytes),
 
                 sr=16000,
 
@@ -965,11 +998,9 @@ async def generate(
 
             content.append({
 
-                "type":
-                    "audio",
+                "type": "audio",
 
-                "audio":
-                    audio_data
+                "audio": audio_data
             })
 
             print(
@@ -984,9 +1015,11 @@ async def generate(
 
                 status_code=400,
 
-                detail=(
-                    f"Invalid audio: {exc}"
-                )
+                detail={
+                    "error": "invalid_audio",
+                    "filename": audio.filename,
+                    "message": str(exc)
+                }
             )
 
     # ========================================================
@@ -995,11 +1028,9 @@ async def generate(
 
     content.append({
 
-        "type":
-            "text",
+        "type": "text",
 
-        "text":
-            prompt
+        "text": prompt
     })
 
     # ========================================================
@@ -1012,20 +1043,16 @@ async def generate(
 
         messages.append({
 
-            "role":
-                "system",
+            "role": "system",
 
-            "content":
-                system_prompt
+            "content": system_prompt
         })
 
     messages.append({
 
-        "role":
-            "user",
+        "role": "user",
 
-        "content":
-            content
+        "content": content
     })
 
     try:
@@ -1053,7 +1080,7 @@ async def generate(
         )
 
         # ====================================================
-        # Print input tensor information
+        # Print input tensors
         # ====================================================
 
         print(
@@ -1090,7 +1117,7 @@ async def generate(
         )
 
         # ====================================================
-        # Input token limit
+        # Token limit
         # ====================================================
 
         if input_tokens > MAX_INPUT_TOKENS:
@@ -1125,7 +1152,7 @@ async def generate(
         )
 
         # ====================================================
-        # Print CUDA input information
+        # Print CUDA input tensors
         # ====================================================
 
         print(
@@ -1194,7 +1221,7 @@ async def generate(
             )
 
         # ====================================================
-        # Remove input tokens
+        # Remove prompt tokens
         # ====================================================
 
         generated_ids = outputs[
@@ -1205,12 +1232,12 @@ async def generate(
         ]
 
         output_tokens = (
-
             generated_ids.shape[-1]
         )
 
         print(
-            f"Output tokens: {output_tokens}"
+            f"Output tokens: "
+            f"{output_tokens}"
         )
 
         # ====================================================
@@ -1274,14 +1301,15 @@ async def generate(
 
                 "message": (
                     "GPU out of memory. "
-                    "Reduce input size or "
-                    "max_output_tokens."
+                    "Try fewer images, "
+                    "smaller images, or "
+                    "fewer output tokens."
                 )
             }
         )
 
     # ========================================================
-    # Runtime Errors
+    # Runtime errors
     # ========================================================
 
     except RuntimeError as exc:
@@ -1301,7 +1329,7 @@ async def generate(
         )
 
     # ========================================================
-    # General Errors
+    # General errors
     # ========================================================
 
     except Exception as exc:
@@ -1317,6 +1345,7 @@ async def generate(
 
             detail=str(exc)
         )
+
 
 
 # ============================================================
