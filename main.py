@@ -46,6 +46,13 @@ MAX_OUTPUT_TOKENS = int(
     )
 )
 
+MAX_IMAGES = int(
+    os.getenv(
+        "MAX_IMAGES",
+        "4"
+    )
+)
+
 
 # ============================================================
 # Local Model Directory
@@ -572,6 +579,59 @@ app = FastAPI(
     version="1.3.0"
 )
 
+# ============================================================
+# OpenAPI Override
+# ============================================================
+
+_original_openapi = app.openapi
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = _original_openapi()
+
+    try:
+        request_schema = (
+            schema["paths"]["/generate"]["post"]
+            ["requestBody"]["content"]["multipart/form-data"]["schema"]
+        )
+
+        body_schema = request_schema
+
+        if "$ref" in request_schema:
+            body_schema_name = request_schema["$ref"].split("/")[-1]
+
+            body_schema = schema["components"]["schemas"].get(
+                body_schema_name,
+                {}
+            )
+
+        images_schema = body_schema.get(
+            "properties",
+            {}
+        ).get("images")
+
+        if images_schema and "items" in images_schema:
+            items = images_schema["items"]
+
+            items.pop("contentMediaType", None)
+            items["type"] = "string"
+            items["format"] = "binary"
+
+    except (KeyError, TypeError, AttributeError) as exc:
+        print(
+            "OpenAPI file-array override warning:",
+            repr(exc)
+        )
+
+    app.openapi_schema = schema
+
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 # ============================================================
 # Health
@@ -752,11 +812,6 @@ def move_inputs_to_cuda(inputs):
 # Generate
 # ============================================================
 
-MAX_IMAGES = int(
-    os.getenv("MAX_IMAGES", "4")
-)
-
-
 @app.post(
     "/generate",
     response_model=GenerateResponse
@@ -785,10 +840,6 @@ async def generate(
 
     max_output_tokens: int | None = Form(
         default=None
-    ),
-
-    MAX_IMAGES = int(
-      os.getenv("MAX_IMAGES", "4")
     ),
 
     temperature: float = Form(
