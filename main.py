@@ -592,39 +592,19 @@ def custom_openapi():
 
     schema = _original_openapi()
 
-    try:
-        request_schema = (
-            schema["paths"]["/generate"]["post"]
-            ["requestBody"]["content"]["multipart/form-data"]["schema"]
-        )
+    for body_schema in schema.get("components", {}).get("schemas", {}).values():
 
-        body_schema = request_schema
+        properties = body_schema.get("properties", {})
 
-        if "$ref" in request_schema:
-            body_schema_name = request_schema["$ref"].split("/")[-1]
-
-            body_schema = schema["components"]["schemas"].get(
-                body_schema_name,
-                {}
-            )
-
-        images_schema = body_schema.get(
-            "properties",
-            {}
-        ).get("images")
+        images_schema = properties.get("images")
 
         if images_schema and "items" in images_schema:
+
             items = images_schema["items"]
 
             items.pop("contentMediaType", None)
             items["type"] = "string"
             items["format"] = "binary"
-
-    except (KeyError, TypeError, AttributeError) as exc:
-        print(
-            "OpenAPI file-array override warning:",
-            repr(exc)
-        )
 
     app.openapi_schema = schema
 
