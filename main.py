@@ -789,7 +789,7 @@ async def generate(
 
     MAX_IMAGES = int(
       os.getenv("MAX_IMAGES", "4")
-    )
+    ),
 
     temperature: float = Form(
         default=0.7
