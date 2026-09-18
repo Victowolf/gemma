@@ -13,6 +13,7 @@ from fastapi import (
     File,
     Form,
 )
+from typing import List
 
 from pydantic import BaseModel
 
@@ -585,26 +586,41 @@ app = FastAPI(
 
 _original_openapi = app.openapi
 
-
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
 
     schema = _original_openapi()
 
-    for body_schema in schema.get("components", {}).get("schemas", {}).values():
+    body_schema = None
 
-        properties = body_schema.get("properties", {})
+    # Find the generated request body schema for /generate
+    request_schema = (
+        schema["paths"]["/generate"]["post"]
+        ["requestBody"]["content"]["multipart/form-data"]["schema"]
+    )
 
-        images_schema = properties.get("images")
+    if "$ref" in request_schema:
+        body_schema_name = request_schema["$ref"].split("/")[-1]
 
-        if images_schema and "items" in images_schema:
+        body_schema = schema["components"]["schemas"].get(
+            body_schema_name
+        )
+    else:
+        body_schema = request_schema
 
-            items = images_schema["items"]
+    if body_schema:
+        images_schema = body_schema.get(
+            "properties", {}
+        ).get("images")
 
-            items.pop("contentMediaType", None)
-            items["type"] = "string"
-            items["format"] = "binary"
+        if images_schema:
+            items = images_schema.get("items")
+
+            if items:
+                items.pop("contentMediaType", None)
+                items["type"] = "string"
+                items["format"] = "binary"
 
     app.openapi_schema = schema
 
@@ -807,8 +823,9 @@ async def generate(
     # --------------------------------------------------------
     # 0–4 images
     # --------------------------------------------------------
-    images: list[UploadFile] | None = File(
-        default=None
+    images: List[UploadFile] = File(
+        default=[],
+        description="Upload multiple images"
     ),
 
     # --------------------------------------------------------
